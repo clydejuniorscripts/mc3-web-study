@@ -1,0 +1,36 @@
+# --- Game-derived output: NEVER commit. Bring your own disc; lift it yourself. ---
+web/web-port.patch
+*.wasm
+*.iso
+*.xiso
+*.xbe
+*.xex
+default.xbe
+game/
+game-*/
+work-dub/
+work-remix/
+gen/
+*.nro
+*.apk
+
+# --- Build artifacts / deps ---
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.o
+*.a
+*.obj
+dist/
+build/
+build-*/
+*.log
+
+# --- OS ---
+Thumbs.db
+.DS_Store
+
+# helper input for tools_pgrep.sh / tools_str.sh
+pat.txt

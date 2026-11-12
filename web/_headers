@@ -1,0 +1,8 @@
+# Cloudflare Pages headers for the game shell.
+# The WASM build uses SharedArrayBuffer (pthreads), which requires the page to
+# be cross-origin isolated. These two headers are mandatory; without them the
+# game's worker threads won't start.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cache-Control: no-store

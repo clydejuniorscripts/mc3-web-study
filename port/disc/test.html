@@ -1,0 +1,80 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MC3 disc import — test</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; background:#111; color:#eee; }
+  h1 { font-size: 1.2rem; } code { color:#f5b041; }
+  #pick { padding:.6rem 1rem; }
+  #bar { height: 14px; background:#333; border-radius:7px; overflow:hidden; margin:.5rem 0; }
+  #fill { height:100%; width:0; background:#f5b041; transition:width .2s; }
+  .ok{color:#4caf50} .bad{color:#e74c3c}
+  pre { background:#1b1b1b; padding:.6rem; border-radius:6px; white-space:pre-wrap; }
+</style>
+<h1>Midnight Club 3 — disc import test</h1>
+<p>Pick your Xbox disc image (<code>.iso</code>: plain XISO or a Redump dump). It parses XDVDFS,
+streams every file into OPFS under <code>/mc3/game/</code>, writes the manifest, and checks
+<code>default.xbe</code> is the USA edition. Then it re-hashes three files from OPFS and compares
+to the Node reference hashes, so you can see the write was byte-exact.</p>
+<input id="pick" type="file" accept=".iso,.xiso,application/octet-stream">
+<div id="bar"><div id="fill"></div></div>
+<div id="status">Waiting for a file…</div>
+<pre id="log"></pre>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const log = (m) => { $("log").textContent += m + "\n"; };
+const REF = {  // Node-verified sha256 of the real USA disc
+  "default.xbe": ["d9db63bb99dc04fd2826886ffc1af2fd76886b268ab6f9395d6164c3ed676c82", 4874240],
+  "downloader.xbe": ["e69ae818fa4190874e9d7187675d64be79d8f249b34e2b31b0ebc7f93840fb43", 1150976],
+  "audio/XStreams/WMA.xsb": ["16abf93851b6aa0b3e6715aa12e4763904e05e645e9f152ee4bbf8b422fdda0d", 212],
+};
+const mb = (n) => (n / 1048576).toFixed(1) + " MB";
+
+async function sha256Opfs(path) {
+  const root = await navigator.storage.getDirectory();
+  let dir = root;
+  const parts = path.split("/"); const name = parts.pop();
+  for (const p of parts) dir = await dir.getDirectoryHandle(p);
+  const buf = await (await (await dir.getFileHandle(name)).getFile()).arrayBuffer();
+  const h = await crypto.subtle.digest("SHA-256", buf);
+  return { hex: [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join(""), size: buf.byteLength };
+}
+
+$("pick").onchange = (e) => {
+  const file = e.target.files[0]; if (!file) return;
+  $("log").textContent = ""; $("fill").style.width = "0";
+  $("status").textContent = `Importing ${file.name} (${mb(file.size)})…`;
+  const t0 = performance.now();
+  const w = new Worker("disc-import.js", { type: "module" });
+  w.onmessage = async (ev) => {
+    const m = ev.data;
+    if (m.type === "progress") {
+      if (m.total) $("fill").style.width = (100 * m.done / m.total).toFixed(1) + "%";
+      $("status").textContent = `${m.phase}: ${m.path} — ${mb(m.done)} / ${mb(m.total)}`;
+    } else if (m.type === "error") {
+      $("status").innerHTML = `<span class="bad">Error:</span> ${m.message}`;
+    } else if (m.type === "done") {
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      $("fill").style.width = "100%";
+      $("status").innerHTML = `<span class="ok">Imported</span> ${m.files} files, ${mb(m.bytes)} in ${secs}s — ` +
+        `title ${m.title.name} (${m.title.id})`;
+      log(`manifest: ${m.manifest.split("\n").length - 1} lines`);
+      log("verifying OPFS bytes vs Node reference hashes…");
+      for (const [path, [refHex, refSize]] of Object.entries(REF)) {
+        try {
+          const r = await sha256Opfs("mc3/game/" + path);
+          const ok = r.hex === refHex && r.size === refSize;
+          log(`  ${ok ? "OK  " : "FAIL"} ${path}  ${r.size}  ${r.hex.slice(0, 16)}…`);
+        } catch (err) { log(`  FAIL ${path}  (${err.message})`); }
+      }
+      try {
+        const r2 = await navigator.storage.getDirectory();
+        const dj = await (await (await r2.getDirectoryHandle("mc3")).getFileHandle("disc.json")).getFile();
+        log("disc.json: " + (await dj.text()).replace(/\s+/g, " "));
+      } catch (err) { log("disc.json MISSING (" + err.message + ")"); }
+      log("done.");
+    }
+  };
+  w.postMessage({ type: "import", file });
+};
+</script>

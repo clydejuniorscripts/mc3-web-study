@@ -1,0 +1,258 @@
+# Switch release: publish a finished Switch build (its NROs: every edition
+# of every game, the DUB Edition's and the Remix's) as a GitHub release. Started by hand (Actions > Switch release > Run workflow): the
+# latest successful "Switch build", or the one whose run ID is given. NSP
+# forwarders are not built here (they need the console keys): make nsp
+# locally (CONTRIBUTING.md, NSP forwarder).
+#
+#   approve   GitHub runner, "release" environment: with required reviewers
+#             set on it (Settings > Environments > release), the release
+#             waits here for approval. Then it checks the build, the version,
+#             the notes and the NROs.
+#   publish   GitHub runner: tags v<version> on the build's commit and
+#             publishes the NROs, and the APK with "android" on.
+#
+# android (off by default): the Android APKs too (every game's), from the
+# latest successful "Android build" (android-build.yml) or the one whose run
+# ID is given in android_run_id: each checked against its .apkinfo, and only
+# release builds (<app>-<ANDROID_VERSION>.apk), never betas. The release is
+# then titled "mcdub3-nx.nro v<version> (Nintendo Switch) and
+# mcdub3-<android version>.apk (Android)" (the DUB Edition's APK named).
+#
+# The release notes are the "## v<version>" section of RELEASE_NOTES.md, as
+# committed in the build's commit; the version is config/dub/app.env's
+# APP_VERSION at that commit.
+name: Switch release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Run ID of the Switch build to release (empty: the latest successful one)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark as a pre-release"
+        type: boolean
+        default: true
+      android:
+        description: "Also publish the Android APKs (a release build of Android build)"
+        type: boolean
+        default: false
+      android_run_id:
+        description: "Run ID of the Android build (empty: the latest successful one)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write     # tag and release
+  actions: read       # the build's artifacts
+
+concurrency:
+  group: switch-release
+  cancel-in-progress: false
+
+jobs:
+  approve:
+    name: Approve and check
+    runs-on: ubuntu-24.04
+    environment: release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ inputs.build_run_id }}
+    outputs:
+      sha: ${{ steps.build.outputs.sha }}
+      tag: ${{ steps.notes.outputs.tag }}
+      version: ${{ steps.notes.outputs.version }}
+    steps:
+      - name: The build
+        id: build
+        run: |
+          if [ -z "$RUN_ID" ]; then
+            # The latest successful Switch build.
+            RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/switch-build.yml/runs?status=success&per_page=1" \
+              --jq '.workflow_runs[0].id // empty')
+            [ -n "$RUN_ID" ] || { echo "no successful Switch build yet: run Switch build first"; exit 1; }
+            echo "No run ID given: the latest successful Switch build, $RUN_ID"
+          fi
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "build_run_id must be a number"; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          # Tab-separated: a workflow name has spaces ("Switch build").
+          IFS=$'\t' read -r path conclusion sha < <(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+            --jq '[.path, .conclusion, .head_sha] | @tsv')
+          [ "$path" = ".github/workflows/switch-build.yml" ] \
+            || { echo "run $RUN_ID is from $path, not a Switch build"; exit 1; }
+          [ "$conclusion" = "success" ] || { echo "run $RUN_ID did not succeed ($conclusion)"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Releasing Switch build $RUN_ID at $sha"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.build.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Can the tag be made?
+        env:
+          HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+        run: |
+          # GitHub refuses (403) a workflow's own token a tag on a commit whose
+          # .github/workflows differ from the default branch's: that needs the
+          # 'workflows' permission, which GITHUB_TOKEN never has (found
+          # 2026-10-21 releasing a build made before workflow fixes). With a
+          # RELEASE_TOKEN secret (fine-grained, Contents + Workflows: write)
+          # any build can be released.
+          [ "$HAS_RELEASE_TOKEN" = "true" ] && exit 0
+          if ! git diff --quiet "${{ steps.build.outputs.sha }}" "origin/$DEFAULT" -- .github/workflows; then
+            echo "::error::The workflows changed since this build (${{ steps.build.outputs.sha }}), so GitHub will not let this workflow tag it. Run a new Switch build and release that one (or add a RELEASE_TOKEN secret)."
+            git diff --stat "${{ steps.build.outputs.sha }}" "origin/$DEFAULT" -- .github/workflows
+            exit 1
+          fi
+
+      - name: Version and notes
+        id: notes
+        run: |
+          source config/dub/app.env
+          for cfg in config/*/app.env; do       # one version for every game
+            v=$(bash -c 'source "$1"; echo "$APP_VERSION"' _ "$cfg")
+            [ "$v" = "$APP_VERSION" ] || { echo "$cfg is version $v, config/dub/app.env $APP_VERSION: one release carries every game"; exit 1; }
+          done
+          tag="v$APP_VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists already: raise APP_VERSION in config/dub/app.env"; exit 1
+          fi
+          # The section of RELEASE_NOTES.md from "## v<version>" to the next "## ".
+          awk -v h="## $tag" '
+            $0 == h || index($0, h " ") == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }' RELEASE_NOTES.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "RELEASE_NOTES.md has no notes under '## $tag' in ${{ steps.build.outputs.sha }}"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.build.outputs.run_id }}
+          github-token: ${{ github.token }}
+          pattern: mcdub3*-nx-*         # mcdub3-nx-<v> (DUB Edition), mcdub3remix-nx-<v> (Remix): every edition's NRO in each
+          path: ${{ runner.temp }}/build
+
+      - name: Check the NROs
+        run: |
+          cd "$RUNNER_TEMP/build"
+          ls -R
+          n=0
+          for info in */*.buildinfo; do
+            v=$(sed -n 's/^version=//p' "$info")
+            [ "$v" = "${{ steps.notes.outputs.version }}" ] \
+              || { echo "$info is version $v, not ${{ steps.notes.outputs.version }}"; exit 1; }
+            nro="${info%.buildinfo}.nro"
+            want=$(sed -n 's/^nro_sha256=//p' "$info")
+            echo "$want  $nro" | sha256sum -c -
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "no NRO in build ${{ steps.build.outputs.run_id }}"; exit 1; }
+          cp "$RUNNER_TEMP/notes.md" ./notes.md
+
+      - name: The Android build
+        if: inputs.android
+        env:
+          ANDROID_RUN_ID: ${{ inputs.android_run_id }}
+        run: |
+          if [ -z "$ANDROID_RUN_ID" ]; then
+            ANDROID_RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/android-build.yml/runs?status=success&per_page=1" \
+              --jq '.workflow_runs[0].id // empty')
+            [ -n "$ANDROID_RUN_ID" ] || { echo "no successful Android build yet: run Android build (channel release) first"; exit 1; }
+            echo "No Android run ID given: the latest successful Android build, $ANDROID_RUN_ID"
+          fi
+          [[ "$ANDROID_RUN_ID" =~ ^[0-9]+$ ]] || { echo "android_run_id must be a number"; exit 1; }
+          IFS=$'\t' read -r path conclusion < <(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ANDROID_RUN_ID" \
+            --jq '[.path, .conclusion] | @tsv')
+          [ "$path" = ".github/workflows/android-build.yml" ] \
+            || { echo "run $ANDROID_RUN_ID is from $path, not an Android build"; exit 1; }
+          [ "$conclusion" = "success" ] || { echo "run $ANDROID_RUN_ID did not succeed ($conclusion)"; exit 1; }
+          gh run download "$ANDROID_RUN_ID" -R "$GITHUB_REPOSITORY" -p 'mcdub3*-android-*' -D "$RUNNER_TEMP/android"
+          mkdir -p "$RUNNER_TEMP/build/android"
+          n=0
+          for info in "$RUNNER_TEMP"/android/*/*.apkinfo; do
+            [ -f "$info" ] || continue
+            channel=$(sed -n 's/^channel=//p' "$info")
+            [ "$channel" = release ] \
+              || { echo "Android build $ANDROID_RUN_ID is a $channel build: publish a release build (Android build, channel release)"; exit 1; }
+            apk="$(dirname "$info")/$(sed -n 's/^apk=//p' "$info")"
+            echo "$(sed -n 's/^apk_sha256=//p' "$info")  $apk" | sha256sum -c -
+            cp "$apk" "$info" "$RUNNER_TEMP/build/android/"
+            echo "Android: $(basename "$apk") from run $ANDROID_RUN_ID"
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "no APK in Android build $ANDROID_RUN_ID"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-checked
+          path: ${{ runner.temp }}/build/
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: approve
+    runs-on: ubuntu-24.04
+    env:
+      # RELEASE_TOKEN when set (see "Can the tag be made?"), else the run's own.
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+      TAG: ${{ needs.approve.outputs.tag }}
+      SHA: ${{ needs.approve.outputs.sha }}
+      PRERELEASE: ${{ inputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-checked
+          path: build
+
+      - name: Publish
+        run: |
+          {
+            desc=$(cat build/*/description.txt 2>/dev/null | sed '/^$/d' | sort -u)
+            [ -n "$desc" ] && printf '%s\n\n' "$desc"
+            cat build/notes.md
+            echo
+            echo "---"
+            echo
+            echo "| File | Game | Edition | SHA-256 |"
+            echo "|---|---|---|---|"
+            for info in build/*/*.buildinfo; do
+              f=$(basename "${info%.buildinfo}.nro")
+              title=$(sed -n 's/^title=//p' "$info"); title=${title:-Midnight Club 3: DUB Edition}
+              echo "| \`$f\` | $title | $(sed -n 's/^edition=//p' "$info") | \`$(sed -n 's/^nro_sha256=//p' "$info")\` |"
+            done
+            if ls build/android/*.apkinfo >/dev/null 2>&1; then
+              echo
+              echo "| File | Game | Platform | Version | SHA-256 |"
+              echo "|---|---|---|---|---|"
+              for apkinfo in build/android/*.apkinfo; do
+                game=$(sed -n 's/^game=//p' "$apkinfo")
+                [ "$game" = remix ] && title="Midnight Club 3: DUB Edition Remix" || title="Midnight Club 3: DUB Edition"
+                echo "| \`$(sed -n 's/^apk=//p' "$apkinfo")\` | $title | Android | $(sed -n 's/^label=//p' "$apkinfo") | \`$(sed -n 's/^apk_sha256=//p' "$apkinfo")\` |"
+              done
+            fi
+            echo
+            echo "Build $(sed -n 's/^build=//p' build/*/*.buildinfo | head -1), commit $SHA."
+          } > body.md
+          flags=()
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          files=(build/*/*.nro)
+          title="mcdub3-nx.nro $TAG (Nintendo Switch)"
+          named=""
+          for apkinfo in build/android/*.apkinfo; do
+            [ -f "$apkinfo" ] || continue
+            apk=$(sed -n 's/^apk=//p' "$apkinfo")
+            files+=("build/android/$apk")
+            # the title names the DUB Edition's APK (mcdub3-<v>.apk), else the first
+            case "$apk" in mcdub3-*) named="$apk" ;; *) named="${named:-$apk}" ;; esac
+          done
+          [ -n "$named" ] && title="$title and $named (Android)"
+          gh release create "$TAG" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --title "$title" --notes-file body.md "${flags[@]}"
+          echo "published $TAG" >> "$GITHUB_STEP_SUMMARY"
